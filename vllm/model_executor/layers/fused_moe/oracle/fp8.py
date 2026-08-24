@@ -310,6 +310,24 @@ def select_fp8_moe_backend(
                 "deployment configuration."
             )
 
+    def _make_log_unsupported_multi(
+        backend: Fp8MoeBackend,
+        rejections: list[tuple[str, str | None]],
+    ) -> str:
+        # A backend can expose several candidate kernels that fail for different
+        # reasons (e.g. one rejects the quant scheme, another the parallel config).
+        # Surfacing only the last reason misleads users, so aggregate them all.
+        if len(rejections) == 1:
+            return _make_log_unsupported(backend, rejections[0][1])
+        lines = "\n".join(
+            f"  - {cls_name}: {reason or 'unsupported'}"
+            for cls_name, reason in rejections
+        )
+        return (
+            f"FP8 MoE backend {backend.value} has no supported kernel for the "
+            f"deployment configuration:\n{lines}"
+        )
+
     def _return_or_raise(
         backend: Fp8MoeBackend,
         config: FusedMoEConfig,
@@ -317,6 +335,7 @@ def select_fp8_moe_backend(
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[Fp8MoeBackend, type[mk.FusedMoEExperts]]:
+        rejections: list[tuple[str, str | None]] = []
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
                 k_cls, config, weight_key, activation_key, activation_format
@@ -324,7 +343,8 @@ def select_fp8_moe_backend(
             if supported:
                 logger.info_once(_make_log_backend(backend))
                 return backend, k_cls
-        raise ValueError(_make_log_unsupported(backend, reason))
+            rejections.append((k_cls.__name__, reason))
+        raise ValueError(_make_log_unsupported_multi(backend, rejections))
 
     # Handle explicit moe_backend from user.
     runner_backend = config.moe_backend
@@ -699,6 +719,7 @@ def make_fp8_moe_kernel(
     experts_cls: type[mk.FusedMoEExperts],
     fp8_backend: Fp8MoeBackend,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    layer: torch.nn.Module | None = None,
 ) -> mk.FusedMoEKernel:
     # Create Prepare/Finalize.
     prepare_finalize = maybe_make_prepare_finalize(
@@ -732,5 +753,11 @@ def make_fp8_moe_kernel(
         prepare_finalize,
         experts,
     )
+
+    # TRTLLM per-tensor FP8 registers per-expert alpha params on the layer so
+    # EPLB rearranges them alongside the experts. Guarded to trtllm: other
+    # backends' hooks may perform in-place scale updates that must not run here.
+    if fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM and layer is not None:
+        experts.process_weights_after_loading(layer)
 
     return kernel

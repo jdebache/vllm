@@ -261,6 +261,17 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
     described above for the Modular case.
     """
 
+    def fused_expert_output_buffer(self) -> torch.Tensor | None:
+        """Return a required fused-expert output buffer after prepare.
+
+        Communication backends may override this when expert compute must
+        write directly into backend-owned storage. Returning ``None`` keeps
+        the ordinary workspace allocation and best-effort output aliasing.
+        Stateful implementations must keep this hook safe for their prepare
+        schedule; the returned tensor is mandatory rather than advisory.
+        """
+        return None
+
     @abstractmethod
     def prepare(
         self,
@@ -1319,8 +1330,31 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
+        required_output = self.prepare_finalize.fused_expert_output_buffer()
+        if required_output is not None:
+            if not isinstance(required_output, torch.Tensor):
+                raise ValueError(
+                    "prepare/finalize supplied a non-tensor fused-expert "
+                    "output buffer"
+                )
+            if (
+                required_output.shape != fused_out.shape
+                or required_output.dtype != fused_out.dtype
+                or required_output.device != fused_out.device
+                or not required_output.is_contiguous()
+            ):
+                raise ValueError(
+                    "prepare/finalize supplied an invalid fused-expert output "
+                    f"buffer: expected contiguous {fused_out.dtype} "
+                    f"{tuple(fused_out.shape)} on {fused_out.device}, got "
+                    f"{required_output.dtype} {tuple(required_output.shape)} "
+                    f"on {required_output.device}"
+                )
+            fused_out = required_output
+
         use_output_alias = (
-            output_alias is not None
+            required_output is None
+            and output_alias is not None
             and output_alias.shape == fused_out.shape
             and output_alias.dtype == fused_out.dtype
             and output_alias.device == fused_out.device

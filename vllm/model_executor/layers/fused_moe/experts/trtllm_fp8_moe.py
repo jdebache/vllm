@@ -110,6 +110,51 @@ class TrtLlmFp8ExpertsBase:
         else:
             self.gemm1_clamp_limit = None
 
+        # Per-tensor alphas are registered as layer parameters in
+        # process_weights_after_loading so EPLB rearranges them in place with the
+        # experts. Caching a detached product here would go stale after the first
+        # expert rearrangement.
+        if self.quant_config.is_per_tensor:
+            assert self.quant_config.w1_scale is not None
+            assert self.quant_config.a1_scale is not None
+            assert self.quant_config.w2_scale is not None
+            assert self.quant_config.a2_scale is not None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Register per-expert dequant alphas as layer parameters.
+
+        w13/w2_weight_scale are per-expert params that EPLB rearranges in place.
+        The per-tensor kernel consumes their products with the (global)
+        activation scales as output1_scales_gate_scalar (g1_alphas),
+        output2_scales_scalar (g2_alphas) and output1_scales_scalar (g1_scale_c).
+        Registering those products on the layer lets EPLB rearrange them
+        alongside the experts, so the kernel always sees matching weight/scale
+        pairs; the cached self references alias the params and stay in sync
+        across rearrangements with no per-forward recompute.
+        """
+        if not self.quant_config.is_per_tensor:
+            return
+        a2_scale = self.quant_config.a2_scale
+        g1_alphas = (self.quant_config.w1_scale * self.quant_config.a1_scale).squeeze()
+        g2_alphas = (self.quant_config.w2_scale * a2_scale).squeeze()
+        g1_scale_c = (
+            g1_alphas / a2_scale
+            if self.moe_config.is_act_and_mul
+            else torch.ones_like(g1_alphas) / a2_scale
+        )
+        layer.register_parameter(
+            "g1_scale_c", torch.nn.Parameter(g1_scale_c, requires_grad=False)
+        )
+        layer.register_parameter(
+            "g1_alphas", torch.nn.Parameter(g1_alphas, requires_grad=False)
+        )
+        layer.register_parameter(
+            "g2_alphas", torch.nn.Parameter(g2_alphas, requires_grad=False)
+        )
+        self._g1_scale_c = layer.g1_scale_c
+        self._g1_alphas = layer.g1_alphas
+        self._g2_alphas = layer.g2_alphas
+
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
@@ -156,22 +201,23 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
-        return (
-            not moe_parallel_config.use_all2all_kernels
-            or moe_parallel_config.use_ag_rs_all2all_kernels
-            or moe_parallel_config.use_deepep_v2_kernels
-            or moe_parallel_config.use_fi_nvl_one_sided_kernels
-            or moe_parallel_config.use_fi_nvl_two_sided_kernels
-        ) and not moe_parallel_config.enable_eplb
+        """The modular implementation supports all parallel configs.
+
+        Routing (including EPLB redundant-expert placement) happens in the
+        FusedMoE dispatch, so the pre-routed kernels are parallel-config-agnostic,
+        matching the NvFp4 modular kernel.
+        """
+        return True
 
     @staticmethod
     def _supports_quant_scheme(
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        """Supports Fp8 block and MXFP8."""
+        """Supports Fp8 per-tensor, Fp8 block, and MXFP8."""
         SUPPORTED_W_A = [
             (kFp8Static128BlockSym, kFp8Dynamic128Sym),
+            (kFp8StaticTensorSym, kFp8StaticTensorSym),
             (kMxfp8Static, kMxfp8Dynamic),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
@@ -238,6 +284,36 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
 
         # Pack topk ids and weights into format expected by the kernel.
         packed_topk_ids = trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights)
+
+        if self.quant_config.is_per_tensor:
+            # Per-tensor static FP8: the activation/weight scales are folded into the
+            # per-expert output scalars (so no hidden-states scale is passed), and the
+            # kernel unpacks the pre-computed packed routing produced by the DP/EP/EPLB
+            # dispatch. Mirrors TrtLlmFp8ExpertsMonolithic._apply_per_tensor.
+            assert activation in [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL]
+            flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_routed_moe(
+                topk_ids=packed_topk_ids,
+                routing_bias=None,
+                hidden_states=hidden_states,
+                gemm1_weights=w1,
+                output1_scales_scalar=self._g1_scale_c,
+                output1_scales_gate_scalar=self._g1_alphas,
+                gemm2_weights=w2,
+                output2_scales_scalar=self._g2_alphas,
+                num_experts=global_num_experts,
+                top_k=topk_ids.size(1),
+                n_group=None,
+                topk_group=None,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.ep_rank * self.local_num_experts,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=None,
+                use_routing_scales_on_input=apply_router_weight_on_input,
+                routing_method_type=1,  # not used (routing pre-computed)
+                activation_type=activation_to_flashinfer_int(activation),
+                output=output,
+            )
+            return
 
         assert a1q_scale is not None
 

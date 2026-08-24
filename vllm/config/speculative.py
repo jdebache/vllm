@@ -13,7 +13,7 @@ from vllm.config import LoadConfig
 from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import HfOverrides, ModelConfig
-from vllm.config.parallel import ParallelConfig
+from vllm.config.parallel import All2AllBackend, ParallelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
@@ -126,6 +126,12 @@ class SpeculativeConfig:
     kv_cache_dtype: CacheDType | None = None
     """KV cache dtype for the draft model. When `None`, the draft inherits the
     target model's `--kv-cache-dtype`."""
+    all2all_backend: All2AllBackend | None = None
+    """MoE all-to-all backend to use for the draft model. When `None`, the draft
+    inherits the target model's `--all2all-backend`. Useful when the generator's
+    backend is unsuitable for the small drafter (e.g. `deepep_high_throughput`, a
+    lockstep prefill collective, deadlocks driving an EAGLE draft's MoE combine;
+    `allgather_reducescatter` runs the draft over plain EP-group collectives)."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""

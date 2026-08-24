@@ -9,19 +9,42 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-# Track whether upstream flash-attn is available on ROCm.
+# Track whether flash-attn C extensions are available.
 # Set during module initialization and never modified afterwards.
 # This module-level flag avoids repeated import attempts and ensures
 # consistent behavior (similar to IS_AITER_FOUND in _aiter_ops.py).
+_CUDA_FLASH_ATTN_AVAILABLE = False
 _ROCM_FLASH_ATTN_AVAILABLE = False
 
 if current_platform.is_cuda():
-    from vllm._custom_ops import reshape_and_cache_flash
-    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
-        compile_flash_attn_varlen_func_from_specs,
-        flash_attn_varlen_func,
-        get_scheduler_metadata,
-    )
+    try:
+        from vllm._custom_ops import reshape_and_cache_flash
+        from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+            compile_flash_attn_varlen_func_from_specs,
+            flash_attn_varlen_func,
+            get_scheduler_metadata,
+        )
+        _CUDA_FLASH_ATTN_AVAILABLE = True
+    except ImportError:
+        # FA2/FA3 C extensions not compiled (e.g. Blackwell-only builds).
+        # FA4 (CuteDSL, Python-only) does not require these extensions.
+        # Stubs raise only if actually called on a platform that needs them.
+        def flash_attn_varlen_func(*args: Any, **kwargs: Any) -> Any:  # type: ignore[misc]
+            raise ImportError(
+                "flash_attn_varlen_func requires the FA2/FA3 CUDA extensions "
+                "(_vllm_fa2_C or _vllm_fa3_C) which were not compiled."
+            )
+
+        def reshape_and_cache_flash(*args: Any, **kwargs: Any) -> Any:  # type: ignore[misc]
+            raise ImportError(
+                "reshape_and_cache_flash requires the FA2/FA3 CUDA extensions "
+                "(_vllm_fa2_C or _vllm_fa3_C) which were not compiled."
+            )
+
+        def get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+            return None
+
+        compile_flash_attn_varlen_func_from_specs = None  # type: ignore[assignment]
 
 elif current_platform.is_xpu():
     from vllm import _custom_ops as ops
@@ -296,9 +319,10 @@ def is_flash_attn_varlen_func_available() -> bool:
     Returns:
         bool: True if a working flash_attn_varlen_func implementation is available.
     """
-    if current_platform.is_cuda() or current_platform.is_xpu():
-        # CUDA and XPU always have flash_attn_varlen_func available
+    if current_platform.is_xpu():
         return True
+    if current_platform.is_cuda():
+        return _CUDA_FLASH_ATTN_AVAILABLE
 
     if current_platform.is_rocm():
         # Use the flag set during module import to check if

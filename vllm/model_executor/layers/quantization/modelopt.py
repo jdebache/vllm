@@ -886,6 +886,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             fp8_backend=self.fp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
+            layer=layer,
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
@@ -2056,6 +2057,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             fp8_backend=self.mxfp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
+            layer=layer,
         )
 
         # No native MXFP8 MoE kernel on this device (e.g. gfx942): the emulation

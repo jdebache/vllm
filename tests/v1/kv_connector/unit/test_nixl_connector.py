@@ -3325,3 +3325,126 @@ def test_explicit_kv_role_no_deprecation_warning(default_vllm_config, dist_init)
             mock_logger.warning_once.assert_not_called(),
             (f"kv_role={role!r} should not emit deprecation warning"),
         )
+
+
+class TestZmqCtxBindRetry:
+    """`zmq_ctx` must retry the side-channel ROUTER bind on EADDRINUSE.
+
+    The NIXL side-channel port is published to remote peers, so a stale
+    socket lingering in TCP TIME_WAIT (e.g. after a previously-crashed
+    engine on the same host/port) would otherwise kill the handshake
+    listener thread on startup and silently break disagg KV transfer.
+    """
+
+    @staticmethod
+    def _eaddrinuse() -> "Exception":
+        import errno as _errno
+
+        import zmq
+
+        return zmq.error.ZMQError(_errno.EADDRINUSE, "Address already in use")
+
+    def test_retries_on_eaddrinuse_then_succeeds(self):
+        import zmq
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+            utils as nixl_utils,
+        )
+
+        eaddrinuse = self._eaddrinuse()
+        fake_sock = MagicMock(name="zmq_socket")
+        fake_ctx = MagicMock(name="zmq_context")
+
+        calls = {"n": 0}
+
+        def fake_make(**kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise eaddrinuse
+            return fake_sock
+
+        with (
+            patch.object(nixl_utils, "make_zmq_socket", side_effect=fake_make),
+            patch.object(nixl_utils.zmq, "Context", return_value=fake_ctx),
+            patch.object(nixl_utils.time, "sleep") as mock_sleep,
+        ):
+            with nixl_utils.zmq_ctx(zmq.ROUTER, "tcp://127.0.0.1:5600") as sock:
+                assert sock is fake_sock
+
+        assert calls["n"] == 3, "should retry until bind succeeds"
+        assert mock_sleep.call_count == 2, "one sleep per failed attempt"
+        # One destroy per failed attempt (2) + one in the `finally` (1).
+        assert fake_ctx.destroy.call_count == 3
+
+    def test_does_not_retry_on_other_zmq_errors(self):
+        import zmq
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+            utils as nixl_utils,
+        )
+
+        other = zmq.error.ZMQError(99, "Some other error")
+        fake_ctx = MagicMock(name="zmq_context")
+
+        with (
+            patch.object(nixl_utils, "make_zmq_socket", side_effect=other),
+            patch.object(nixl_utils.zmq, "Context", return_value=fake_ctx),
+            patch.object(nixl_utils.time, "sleep") as mock_sleep,
+        ):
+            with pytest.raises(zmq.error.ZMQError) as exc_info:
+                with nixl_utils.zmq_ctx(zmq.ROUTER, "tcp://127.0.0.1:5600"):
+                    pass
+
+        assert exc_info.value.errno == 99
+        assert mock_sleep.call_count == 0
+
+    def test_does_not_retry_for_req_sockets(self):
+        # REQ sockets `connect`, not `bind`, so EADDRINUSE cannot apply at
+        # the application layer; if make_zmq_socket somehow raises it here
+        # we must surface it immediately rather than spinning for minutes.
+        import zmq
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+            utils as nixl_utils,
+        )
+
+        eaddrinuse = self._eaddrinuse()
+        fake_ctx = MagicMock(name="zmq_context")
+
+        with (
+            patch.object(nixl_utils, "make_zmq_socket", side_effect=eaddrinuse),
+            patch.object(nixl_utils.zmq, "Context", return_value=fake_ctx),
+            patch.object(nixl_utils.time, "sleep") as mock_sleep,
+        ):
+            with pytest.raises(zmq.error.ZMQError):
+                with nixl_utils.zmq_ctx(zmq.REQ, "tcp://127.0.0.1:5600"):
+                    pass
+
+        assert mock_sleep.call_count == 0
+
+    def test_gives_up_after_max_attempts(self):
+        import errno as _errno
+
+        import zmq
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+            utils as nixl_utils,
+        )
+
+        eaddrinuse = self._eaddrinuse()
+        fake_ctx = MagicMock(name="zmq_context")
+
+        with (
+            patch.object(nixl_utils, "make_zmq_socket", side_effect=eaddrinuse),
+            patch.object(nixl_utils.zmq, "Context", return_value=fake_ctx),
+            patch.object(nixl_utils.time, "sleep") as mock_sleep,
+            patch.object(nixl_utils, "_ZMQ_BIND_MAX_ATTEMPTS", 3),
+        ):
+            with pytest.raises(zmq.error.ZMQError) as exc_info:
+                with nixl_utils.zmq_ctx(zmq.ROUTER, "tcp://127.0.0.1:5600"):
+                    pass
+
+        assert exc_info.value.errno == _errno.EADDRINUSE
+        # 3 attempts total => 2 sleeps between them, and we re-raise after
+        # the last failure (no sleep after the final attempt).
+        assert mock_sleep.call_count == 2

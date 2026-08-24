@@ -1297,6 +1297,15 @@ class SpecDecodeBaseProposer:
                 ),
             )
 
+        if spec_cfg.all2all_backend is not None:
+            base = replace(
+                base,
+                parallel_config=replace(
+                    base.parallel_config,
+                    all2all_backend=spec_cfg.all2all_backend,
+                ),
+            )
+
         # Note (matt): Never inherit the attention backend from base, because there are
         # many opportunities for incompatibility, so we always independently autoselect
         # unless explicitly specified in the speculative config.

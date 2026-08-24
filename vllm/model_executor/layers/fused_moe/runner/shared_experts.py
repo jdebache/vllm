@@ -85,6 +85,7 @@ class SharedExperts(torch.nn.Module):
         _EPLB_OVERLAP_SAFE_BACKENDS = (
             "allgather_reducescatter",
             "flashinfer_nvlink_one_sided",
+            "flashinfer_gin",
         )
 
         parallel_config = self._moe_config.moe_parallel_config

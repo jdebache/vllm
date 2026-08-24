@@ -139,6 +139,9 @@ nvfp4_block_scale_interleave = _lazy_import_wrapper(
 flashinfer_cute_dsl_fused_moe_nvfp4 = _lazy_import_wrapper(
     "flashinfer", "cute_dsl_fused_moe_nvfp4"
 )
+flashinfer_cute_dsl_moe_wrapper = _lazy_import_wrapper(
+    "flashinfer", "CuteDslMoEWrapper"
+)
 flashinfer_convert_sf_to_mma_layout = _lazy_import_wrapper(
     "flashinfer.cute_dsl.utils", "convert_sf_to_mma_layout"
 )
@@ -205,6 +208,28 @@ def has_flashinfer_nvlink_one_sided() -> bool:
     if not has_flashinfer_comm():
         return False
     return importlib.util.find_spec("flashinfer.comm.trtllm_moe_alltoall") is not None
+
+
+@functools.cache
+def has_flashinfer_gin() -> bool:
+    """Return ``True`` when FlashInfer's JIT-only GIN backend is available."""
+    if not has_flashinfer_comm():
+        return False
+    # GIN is not shipped by flashinfer-cubin: it always builds against the
+    # NCCL device API selected by the local deployment.
+    if shutil.which("nvcc") is None:
+        logger.debug_once("FlashInfer GIN unavailable since nvcc was not found")
+        return False
+    if importlib.util.find_spec("flashinfer.comm.gin_moe_alltoall") is None:
+        return False
+    comm = _get_submodule("flashinfer.comm")
+    return bool(
+        comm
+        and hasattr(comm, "GinMoeAlltoAll")
+        and hasattr(comm.GinMoeAlltoAll, "preload")
+        and hasattr(comm.GinMoeAlltoAll, "allocate_recv_views")
+        and hasattr(comm, "gin_moe_get_unique_id")
+    )
 
 
 @functools.cache
@@ -306,11 +331,14 @@ def has_flashinfer_cutedsl_grouped_gemm_nt_masked() -> bool:
 
 @functools.cache
 def has_flashinfer_cutedsl_moe_nvfp4() -> bool:
-    """Return ``True`` if FlashInfer cute_dsl_fused_moe_nvfp4 is available."""
+    """Return ``True`` if FlashInfer's graph-safe CuteDSL MoE is available."""
     if not has_flashinfer_cutedsl():
         return False
     mod = _get_submodule("flashinfer")
-    return mod is not None and hasattr(mod, "cute_dsl_fused_moe_nvfp4")
+    return mod is not None and all(
+        hasattr(mod, name)
+        for name in ("cute_dsl_fused_moe_nvfp4", "CuteDslMoEWrapper")
+    )
 
 
 @functools.cache
@@ -1037,6 +1065,7 @@ __all__ = [
     "scaled_fp4_grouped_quantize",
     "nvfp4_block_scale_interleave",
     "flashinfer_cute_dsl_fused_moe_nvfp4",
+    "flashinfer_cute_dsl_moe_wrapper",
     "flashinfer_b12x_fused_moe",
     "flashinfer_convert_sf_to_mma_layout",
     "trtllm_fp4_block_scale_moe",

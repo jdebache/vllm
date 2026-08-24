@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base scheduler-side logic for the NIXL connector."""
 
+import errno
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -26,11 +27,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlHandshakePayload,
     ReqId,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
-from vllm.utils.network_utils import make_zmq_path
+from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -100,6 +100,10 @@ class NixlBaseConnectorScheduler:
         # Background thread for handling new handshake requests.
         self._nixl_handshake_listener_t: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # Populated by the listener thread if it dies before the socket is
+        # ready, so ``set_xfer_handshake_metadata`` can fail fast instead of
+        # blocking forever in ``ready_event.wait()``.
+        self._listener_error: BaseException | None = None
 
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
@@ -308,35 +312,103 @@ class NixlBaseConnectorScheduler:
             ready_event = threading.Event()
             self._nixl_handshake_listener_t = threading.Thread(
                 target=self._nixl_handshake_listener,
-                args=(
-                    encoded_data,
-                    ready_event,
-                    self._stop_event,
-                    self.side_channel_host,
-                    self.side_channel_port,
-                ),
+                args=(encoded_data, ready_event, self._stop_event),
                 daemon=True,
                 name="nixl_handshake_listener",
             )
             self._nixl_handshake_listener_t.start()
             ready_event.wait()  # Wait for listener ZMQ socket to be ready.
+            # The listener always sets ``ready_event`` -- even on a bind
+            # failure -- so a dead listener surfaces here as a fast crash
+            # instead of an indefinite hang. Without this, a failed bind
+            # leaves the engine blocked in ``wait()``, the DP group stalls on
+            # the coordinator, and only an external timeout kills the run.
+            if self._listener_error is not None:
+                raise RuntimeError(
+                    "NIXL handshake listener failed to start on "
+                    f"{self.side_channel_host}"
+                ) from self._listener_error
 
-    @staticmethod
+    def _bind_side_channel_socket(
+        self, ctx: zmq.Context, host: str, port: int
+    ) -> zmq.Socket:
+        """Bind the side-channel ROUTER socket, self-healing on EADDRINUSE.
+
+        Prefer the configured ``port`` (deterministic, so co-tenant jobs stay
+        in disjoint bands), but if it is already taken -- e.g. an ephemeral
+        source port from an unrelated outbound connection squatted it -- fall
+        back to a kernel-assigned port via ``bind(0)`` instead of dying. A
+        ``bind(0)`` is an atomic free-port allocation, so it cannot collide.
+
+        The port is only ever learned by peers dynamically (advertised as
+        ``remote_port`` / ``decode_port`` in ``kv_transfer_params``), so any
+        actually-bound port works. The chosen port is written back to
+        ``self.side_channel_port`` so every later advertisement uses it.
+        """
+        try:
+            sock = make_zmq_socket(
+                ctx=ctx,
+                path=make_zmq_path("tcp", host, port),
+                socket_type=zmq.ROUTER,
+                bind=True,
+            )
+        except zmq.error.ZMQError as e:
+            if e.errno != errno.EADDRINUSE or port == 0:
+                raise
+            logger.warning(
+                "NIXL side-channel port %d on %s is already in use (likely a "
+                "transient ephemeral source-port squatter); falling back to a "
+                "kernel-assigned port.",
+                port,
+                host,
+            )
+            sock = make_zmq_socket(
+                ctx=ctx,
+                path=make_zmq_path("tcp", host, 0),
+                socket_type=zmq.ROUTER,
+                bind=True,
+            )
+
+        endpoint = sock.getsockopt(zmq.LAST_ENDPOINT)
+        if isinstance(endpoint, bytes):
+            endpoint = endpoint.decode()
+        bound_port = int(endpoint.rsplit(":", 1)[1])
+        if bound_port != self.side_channel_port:
+            logger.info(
+                "NIXL side-channel listening on %s:%d", host, bound_port
+            )
+            self.side_channel_port = bound_port
+        return sock
+
     def _nixl_handshake_listener(
+        self,
         encoded_data: dict[tuple[int, int], Any],
         ready_event: threading.Event,
         stop_event: threading.Event,
-        host: str,
-        port: int,
     ):
-        """Background thread for getting new NIXL handshakes."""
-        # NOTE(rob): this is a simple implementation. We will move
-        # to a better approach via HTTP endpoint soon.
+        """Background thread for getting new NIXL handshakes.
 
-        # Listen for new requests for metadata.
-        path = make_zmq_path("tcp", host, port)
-        logger.debug("Starting listening on path: %s", path)
-        with zmq_ctx(zmq.ROUTER, path) as sock:
+        NOTE(rob): this is a simple implementation. We will move to a better
+        approach via HTTP endpoint soon.
+        """
+        host = self.side_channel_host
+        ctx: zmq.Context | None = None
+        try:
+            ctx = zmq.Context()  # type: ignore[attr-defined]
+            sock = self._bind_side_channel_socket(
+                ctx, host, self.side_channel_port
+            )
+        except Exception as e:
+            # Record the error and release the waiter so the engine fails
+            # fast rather than blocking forever on ``ready_event``.
+            logger.exception("NIXL handshake listener failed to bind on %s", host)
+            self._listener_error = e
+            if ctx is not None:
+                ctx.destroy(linger=0)
+            ready_event.set()
+            return
+
+        try:
             sock.setsockopt(zmq.RCVTIMEO, 1000)
             ready_event.set()
             while True:
@@ -363,6 +435,8 @@ class NixlBaseConnectorScheduler:
                 sock.send_multipart(
                     (identity, b"", encoded_data[(target_pp_rank, target_tp_rank)], ts)
                 )
+        finally:
+            ctx.destroy(linger=0)
 
     def _get_remote_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. Returns N-1 for Mamba models since the decoder

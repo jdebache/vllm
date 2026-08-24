@@ -8,6 +8,26 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     list(APPEND VLLM_GPU_ARCHES "${_ARCH}-real")
   endforeach()
 endif()
+set(_VLLM_FA_NEED_FA2 FALSE)
+set(_VLLM_FA_NEED_FA3 FALSE)
+foreach(_ARCH ${CUDA_ARCHS})
+  string(REGEX MATCH "^([0-9]+)" _ARCH_MAJOR "${_ARCH}")
+  if(CMAKE_MATCH_1 LESS 10)
+    set(_VLLM_FA_NEED_FA2 TRUE)
+  endif()
+  if(CMAKE_MATCH_1 EQUAL 9)
+    set(_VLLM_FA_NEED_FA3 TRUE)
+  endif()
+endforeach()
+
+if(NOT _VLLM_FA_NEED_FA2)
+  message(STATUS "Disabling FA2: no sub-sm100 target archs in ${CUDA_ARCHS}")
+  set(FA2_ENABLED OFF CACHE BOOL "Disable FA2 (no compatible archs)" FORCE)
+endif()
+if(NOT _VLLM_FA_NEED_FA3)
+  message(STATUS "Disabling FA3: no sm90 target archs in ${CUDA_ARCHS}")
+  set(FA3_ENABLED OFF CACHE BOOL "Disable FA3 (no compatible archs)" FORCE)
+endif()
 
 #
 # Build vLLM flash attention from source
@@ -36,11 +56,16 @@ if(VLLM_FLASH_ATTN_SRC_DIR)
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 else()
+  set(_VLLM_FA_FETCH_ARGS "")
+  if(VLLM_GPU_LANG STREQUAL "CUDA")
+    list(APPEND _VLLM_FA_FETCH_ARGS GIT_SUBMODULES "csrc/cutlass")
+  endif()
   FetchContent_Declare(
           vllm-flash-attn
           GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
           GIT_TAG f3e1a4f74c99145c0717709860bf765de1703779
           GIT_PROGRESS TRUE
+          ${_VLLM_FA_FETCH_ARGS}
           # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )

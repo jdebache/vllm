@@ -52,6 +52,7 @@ All2AllBackend = Literal[
     "flashinfer_all2allv",  # temporary alias for flashinfer_nvlink_two_sided
     "flashinfer_nvlink_two_sided",
     "flashinfer_nvlink_one_sided",
+    "flashinfer_gin",
 ]
 
 
@@ -195,7 +196,26 @@ class ParallelConfig:
     - "mori_low_latency": MoRI EP with InterNodeV1LL for multi-node
     - "nixl_ep": Use nixl-ep kernels
     - "flashinfer_nvlink_two_sided": Use flashinfer two-sided kernels for mnnvl
-    - "flashinfer_nvlink_one_sided": Use flashinfer high-throughput a2a kernels"""
+    - "flashinfer_nvlink_one_sided": Use flashinfer high-throughput a2a kernels
+    - "flashinfer_gin": Use FlashInfer GPU-initiated multi-node GIN kernels"""
+
+    flashinfer_gin_max_num_tokens: int | None = Field(default=None, ge=1)
+    """Maximum tokens per EP rank provisioned by ``flashinfer_gin``.
+
+    By default the scheduler's maximum batched-token count is used. Setting a
+    lower value substantially reduces the persistent symmetric workspace for a
+    decode-only deployment, but a forward with more tokens will be rejected.
+    """
+
+    flashinfer_gin_combine_quant: bool = False
+    """Use NVFP4 rather than BF16 for the ``flashinfer_gin`` combine payload."""
+
+    flashinfer_gin_zero_copy_combine: bool = False
+    """Skip staging the ``flashinfer_gin`` expert output before combine.
+
+    Raw BF16 combine allocates an additional registered input buffer. NVFP4
+    combine quantizes directly from the ordinary fused-expert output.
+    """
 
     max_parallel_loading_workers: int | None = Field(default=None, ge=1)
     """Maximum number of parallel loading workers when loading model
@@ -471,6 +491,20 @@ class ParallelConfig:
                 self.all2all_backend,
             )
             self.all2all_backend = "allgather_reducescatter"
+
+        if self.all2all_backend == "flashinfer_gin":
+            if not self.enable_expert_parallel:
+                raise ValueError("flashinfer_gin requires enable_expert_parallel=True.")
+            # EPLB is compatible because it remaps logical experts among fixed
+            # physical slots. The MoE boundary validates that fixed layout.
+            if self.enable_elastic_ep:
+                raise ValueError("flashinfer_gin does not support elastic EP.")
+            if self.expert_placement_strategy != "linear":
+                raise ValueError("flashinfer_gin requires linear expert placement.")
+            if self.use_ubatching:
+                raise ValueError(
+                    "flashinfer_gin does not support DBO or multiple ubatches."
+                )
 
         if self.data_parallel_size_local > self.data_parallel_size:
             raise ValueError(

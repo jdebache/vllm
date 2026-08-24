@@ -789,7 +789,7 @@ def _prefetch_all_checkpoints(
                 if total_for_rank > 0 and next_log_pct <= 100:
                     pct = 100 * completed / total_for_rank
                     if pct >= next_log_pct:
-                        logger.info(
+                        logger.debug(
                             "Prefetching checkpoint files: %d%% (%d/%d)",
                             next_log_pct,
                             completed,
@@ -812,12 +812,12 @@ def _prefetch_all_checkpoints(
         start = time.perf_counter()
         asyncio.run(_prefetch_all())
         elapsed = time.perf_counter() - start
-        logger.info(
+        logger.debug(
             "Prefetching checkpoint files into page cache finished in %.2fs",
             elapsed,
         )
 
-    logger.info(
+    logger.debug(
         "Prefetching checkpoint files into page cache started "
         "(in background, num_threads=%d, block_size=%d bytes)",
         num_prefetch_threads,

@@ -84,12 +84,22 @@ class FlashInferNVLinkTwoSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         global_num_tokens_cpu = get_local_sizes()
         top_k = topk_ids.size(1)
 
+        # a1_gscale (= 1/a1_scale) is a *multiplier* only in the nvfp4
+        # quantization convention; the fp8 quant kernels treat the scale as a
+        # divisor, so per-tensor fp8 must pass a1_scale here or the
+        # activations are quantized with the reciprocal of the intended scale
+        # (mirrors naive_dp_ep.prepare).
+        input_sf = (
+            quant_config.a1_gscale
+            if quant_config.use_nvfp4_w4a4
+            else quant_config.a1_scale
+        )
         (self.alltoall_info, topk_ids, topk_weights, a1q, a1q_scale) = (
             flashinfer_alltoall_dispatch(
                 self.all2all_manager,
                 global_num_tokens_cpu,
                 a1,
-                quant_config.a1_gscale,
+                input_sf,
                 topk_ids,
                 topk_weights,
                 top_k,

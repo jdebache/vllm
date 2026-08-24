@@ -1553,11 +1553,17 @@ endif()
 
 # For CUDA we also build and ship some external projects.
 if (VLLM_GPU_LANG STREQUAL "CUDA")
-    include(cmake/external_projects/deepgemm.cmake)
+    option(VLLM_USE_DEEPGEMM "Build and vendor the DeepGEMM extension" ON)
+    if (VLLM_USE_DEEPGEMM)
+        include(cmake/external_projects/deepgemm.cmake)
+    endif()
     include(cmake/external_projects/fmha_sm100.cmake)
     include(cmake/external_projects/flashmla.cmake)
     include(cmake/external_projects/flashkda.cmake)
-    include(cmake/external_projects/qutlass.cmake)
+    option(VLLM_USE_QUTLASS "Build the QuTLASS quantized GEMM extension" ON)
+    if (VLLM_USE_QUTLASS)
+        include(cmake/external_projects/qutlass.cmake)
+    endif()
     include(cmake/external_projects/tml_fa4.cmake)
 
     # vllm-flash-attn should be last as it overwrites some CMake functions

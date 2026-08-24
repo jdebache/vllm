@@ -100,15 +100,31 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         if defer_input_quant:
             a1q, a1q_scale = a1, None
         else:
+            # a1_gscale (= 1/a1_scale) is a *multiplier* only in the nvfp4
+            # quantization convention; the fp8 quant kernels treat the scale
+            # as a divisor, so per-tensor fp8 must pass a1_scale here or the
+            # activations are quantized with the reciprocal of the intended
+            # scale (mirrors naive_dp_ep.prepare).
+            input_sf = (
+                quant_config.a1_gscale
+                if quant_config.use_nvfp4_w4a4
+                else quant_config.a1_scale
+            )
             a1q, a1q_scale = moe_kernel_quantize_input(
                 a1,
-                quant_config.a1_gscale,
+                input_sf,
                 quant_config.quant_dtype,
                 quant_config.per_act_token_quant,
                 quant_config.block_shape,
                 is_scale_swizzled=False,  # delay swizzle to after comm
                 mx_alignment=quant_config.mx_alignment,
             )
+
+        # Per-tensor FP8 scales are rank-invariant constants folded into the
+        # expert output scalars. They are not per-token payloads and therefore
+        # must not be sent through the all-to-all dispatch.
+        if quant_config.use_fp8_w8a8 and quant_config.is_per_tensor:
+            a1q_scale = None
 
         payloads = []
         payloads.append(a1q)
@@ -123,7 +139,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             token_selected_experts=topk_ids,
             input_payloads=payloads,
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
-            invalid_token_expert_id=-1,  # Follow TRTLLM Pattern
+            invalid_token_expert_id=num_experts,
             expert_id_payload_index=topk_ids_payload_index,
         )
         if a1q_scale is not None:

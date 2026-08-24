@@ -12,8 +12,54 @@ from vllm import envs, ir
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+
+def _flashinfer_fused_add_rmsnorm(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    # In-place: residual += x; x = rmsnorm(residual) * weight. Runs eagerly
+    # inside this opaque op, so FlashInfer's per-shape CuTe-DSL JIT sees
+    # concrete shapes (never the SymInt token dim from Dynamo tracing).
+    from flashinfer.norm import fused_add_rmsnorm
+
+    fused_add_rmsnorm(x, residual, weight, eps)
+
+
+def _flashinfer_fused_add_rmsnorm_fake(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    return
+
+
+def _flashinfer_rmsnorm(
+    out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    from flashinfer.norm import rmsnorm
+
+    rmsnorm(x, weight, eps, out=out)
+
+
+def _flashinfer_rmsnorm_fake(
+    out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    "flashinfer_fused_add_rmsnorm",
+    _flashinfer_fused_add_rmsnorm,
+    mutates_args=["x", "residual"],
+    fake_impl=_flashinfer_fused_add_rmsnorm_fake,
+)
+direct_register_custom_op(
+    "flashinfer_rmsnorm",
+    _flashinfer_rmsnorm,
+    mutates_args=["out"],
+    fake_impl=_flashinfer_rmsnorm_fake,
+)
 
 
 def poly_norm(
@@ -93,6 +139,20 @@ class RMSNorm(CustomOp):
                 self.variance_size_override,
             )
 
+    def _can_use_flashinfer(self, x: torch.Tensor) -> bool:
+        # FlashInfer's rmsnorm/fused_add_rmsnorm require a weight, normalize
+        # over the full last dim, and support only fp16/bf16 with a
+        # matching-dtype weight.
+        return (
+            envs.VLLM_RMSNORM_FLASHINFER
+            and self.has_weight
+            and self.variance_size_override is None
+            and x.is_cuda
+            and x.is_contiguous()
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and self.weight.data.dtype == x.dtype
+        )
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -111,6 +171,27 @@ class RMSNorm(CustomOp):
                 self.variance_epsilon,
                 residual=residual,
             )
+
+        if self._can_use_flashinfer(x):
+            # Route through vLLM-registered opaque wrappers (below), NOT the
+            # FlashInfer python API. FlashInfer stubs out its own
+            # register_custom_op (utils.py: returns lambda x: x), so its
+            # functions are plain python that torch.compile would inline,
+            # dragging the per-shape CuTe-DSL JIT into Dynamo tracing (dies on
+            # the symbolic token dim). Our wrappers carry a fake, so Dynamo
+            # keeps them opaque and the JIT runs eagerly at capture instead.
+            weight = self.weight.data
+            if residual is not None:
+                if not residual.is_contiguous() or x.dim() != 2:
+                    return self.forward_native(x, residual)
+                # In-place: residual += x; x = rmsnorm(residual) * weight.
+                torch.ops.vllm.flashinfer_fused_add_rmsnorm(
+                    x, residual, weight, self.variance_epsilon
+                )
+                return x, residual
+            out = torch.empty_like(x)
+            torch.ops.vllm.flashinfer_rmsnorm(out, x, weight, self.variance_epsilon)
+            return out
 
         return self.forward_native(x, residual)
 

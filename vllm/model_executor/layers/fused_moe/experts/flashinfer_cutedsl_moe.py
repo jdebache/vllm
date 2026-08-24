@@ -23,7 +23,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
-    flashinfer_cute_dsl_fused_moe_nvfp4,
+    flashinfer_cute_dsl_moe_wrapper,
     has_flashinfer_cutedsl_moe_nvfp4,
 )
 
@@ -59,9 +59,36 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         self.global_num_experts = moe_config.num_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
         self.local_expert_offset = self.ep_rank * self.local_num_experts
-        self.gemm1_alpha = quant_config.gemm1_alpha
-        self.gemm1_beta = quant_config.gemm1_beta
-        self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
+
+        # The kernel defaults swiglu_{alpha,beta,limit} to the plain-SwiGLU
+        # values, so only forward the ones the model actually sets.
+        swiglu_params: dict[str, float | None] = {}
+        if moe_config.activation == MoEActivation.SILU:
+            swiglu_params = {"swiglu_limit": quant_config.gemm1_clamp_limit}
+        elif moe_config.activation in (
+            MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        ):
+            swiglu_params = {
+                "swiglu_alpha": quant_config.gemm1_alpha,
+                "swiglu_beta": quant_config.gemm1_beta,
+                "swiglu_limit": quant_config.gemm1_clamp_limit,
+            }
+        swiglu_kwargs = {k: v for k, v in swiglu_params.items() if v is not None}
+
+        self.moe_wrapper = flashinfer_cute_dsl_moe_wrapper(
+            num_experts=self.global_num_experts,
+            top_k=self.topk,
+            hidden_size=self.hidden_dim,
+            intermediate_size=self.intermediate_size_per_partition,
+            use_cuda_graph=True,
+            num_local_experts=self.local_num_experts,
+            local_expert_offset=self.local_expert_offset,
+            output_dtype=self.out_dtype,
+            device=moe_config.device,
+            activation_type=activation_to_flashinfer_int(moe_config.activation),
+            **swiglu_kwargs,
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
@@ -149,6 +176,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         apply_router_weight_on_input: bool | None,
     ):
         assert self.quant_dtype == "nvfp4"
+        assert activation == self.moe_config.activation
         assert a1q_scale is not None
         assert self.w1_scale is not None
         assert self.w2_scale is not None
@@ -157,23 +185,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         # The functional API expects x_sf with trailing dim: (M, K//16, 1).
         x_sf = a1q_scale.unsqueeze(-1)
 
-        # The kernel defaults swiglu_{alpha,beta,limit} to the plain-SwiGLU
-        # values, so only forward the ones the model actually sets.
-        swiglu_params: dict[str, float | None] = {}
-        if activation == MoEActivation.SILU:
-            swiglu_params = {"swiglu_limit": self.gemm1_clamp_limit}
-        elif activation in (
-            MoEActivation.SWIGLUOAI,
-            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
-        ):
-            swiglu_params = {
-                "swiglu_alpha": self.gemm1_alpha,
-                "swiglu_beta": self.gemm1_beta,
-                "swiglu_limit": self.gemm1_clamp_limit,
-            }
-        swiglu_kwargs = {k: v for k, v in swiglu_params.items() if v is not None}
-
-        flashinfer_cute_dsl_fused_moe_nvfp4(
+        self.moe_wrapper.run(
             x=hidden_states,
             x_sf=x_sf,
             token_selected_experts=topk_ids.to(torch.int32),
@@ -185,11 +197,5 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             w2_weight=w2,
             w2_weight_sf=self.w2_scale,
             w2_alpha=self.g2_alphas,
-            num_experts=self.global_num_experts,
-            top_k=self.topk,
-            num_local_experts=self.local_num_experts,
-            local_expert_offset=self.local_expert_offset,
             moe_output=output,
-            activation_type=activation_to_flashinfer_int(activation),
-            **swiglu_kwargs,
         )

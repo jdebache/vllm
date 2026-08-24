@@ -1885,6 +1885,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
             del self.kv_cache_config
+        if self.vllm_config.parallel_config.all2all_backend == "flashinfer_gin":
+            # Full CUDA graphs are owned directly by these managers rather
+            # than by the global graph-wrapper registries. Release them before
+            # free_before_shutdown() and, ultimately, collective GIN teardown.
+            self.cudagraph_manager = None
+            if getattr(self, "speculator", None) is not None:
+                self.speculator = None
+            gc.collect()
+            torch.accelerator.synchronize()
+        from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep_cutedsl import (
+            destroy_flashinfer_moe_ep_cutedsl,
+            has_flashinfer_moe_ep_cutedsl,
+        )
+
+        if has_flashinfer_moe_ep_cutedsl():
+            from vllm.compilation.breakable_cudagraph import (
+                BreakableCUDAGraphWrapper,
+            )
+            from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+            CUDAGraphWrapper.clear_all_graphs()
+            BreakableCUDAGraphWrapper.clear_all_graphs()
+            cudagraph_manager = getattr(self, "cudagraph_manager", None)
+            if cudagraph_manager is not None:
+                cudagraph_manager.graphs.clear()
+                cudagraph_manager.breakable_cg_runner = None
+                self.cudagraph_manager = None
+                del cudagraph_manager
+            torch.accelerator.synchronize()
+            destroy_flashinfer_moe_ep_cutedsl()
         free_before_shutdown(self.vllm_config)
         if hasattr(self, "model_state"):
             del self.model_state

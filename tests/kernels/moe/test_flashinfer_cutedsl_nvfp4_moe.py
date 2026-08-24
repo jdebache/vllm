@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for FlashInfer CuTeDSL NVFP4 MoE."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -314,11 +315,73 @@ def test_flashinfer_cutedsl_fp4_moe(
             atol=3e-2,
             rtol=2e-1,
         )
-        # Outputs here are O(1e-2) while NVFP4 noise is O(1e-3), so an absolute
-        # tolerance loose enough for the quantization error also accepts a zero
-        # tensor. Compare direction too, which dropped SwiGLU params or a wrong
-        # w13 layout would break.
-        cosine = torch.nn.functional.cosine_similarity(
-            cutedsl_output.flatten().float(), torch_output.flatten().float(), dim=0
+
+        # GIN returns dense [source_rank, runtime_max_tokens, ...] views with
+        # linear uint8 NVFP4 scale factors and global expert IDs.  Reuse the
+        # same inputs/weights to exercise that exact CuTeDSL contract on the
+        # second EP shard; all--1 rows are GIN padding and must stay zero.
+        ep_size, ep_rank = 2, 1
+        runtime_max_tokens = m // ep_size
+        gin_packed = a_q.view(ep_size, runtime_max_tokens, k // 2)
+        gin_scales = a_scale.view(torch.uint8).view(
+            ep_size, runtime_max_tokens, k // 16
         )
-        assert cosine > 0.99, f"cosine similarity {cosine:.4f} below 0.99"
+        gin_ids = (topk_ids.to(torch.int32) + e).view(
+            ep_size, runtime_max_tokens, topk
+        )
+        gin_weights = topk_weights.float().view(
+            ep_size, runtime_max_tokens, topk
+        )
+        padding_rows = torch.tensor([2, runtime_max_tokens + 1], device="cuda")
+        gin_ids.view(m, topk)[padding_rows] = -1
+
+        assert gin_packed.dtype == torch.uint8
+        assert gin_scales.dtype == torch.uint8
+        assert quant_config.is_scale_swizzled is False
+
+        ep_parallel_config = replace(
+            FusedMoEParallelConfig.make_no_parallel(),
+            dp_size=ep_size,
+            ep_size=ep_size,
+            dp_rank=ep_rank,
+            ep_rank=ep_rank,
+            use_ep=True,
+            all2all_backend="flashinfer_gin",
+        )
+        ep_moe_config = replace(
+            moe_config,
+            num_experts=ep_size * e,
+            num_logical_experts=ep_size * e,
+            moe_parallel_config=ep_parallel_config,
+        )
+        ep_experts = FlashInferCuteDSLExperts(ep_moe_config, quant_config)
+        assert ep_experts.local_expert_offset == e
+
+        ep_output = torch.empty_like(cutedsl_output)
+        ep_experts.apply(
+            output=ep_output,
+            hidden_states=gin_packed.flatten(0, 1),
+            w1=w1_cutedsl,
+            w2=w2_cutedsl,
+            topk_weights=gin_weights.flatten(0, 1),
+            topk_ids=gin_ids.flatten(0, 1),
+            activation=activation,
+            global_num_experts=ep_size * e,
+            expert_map=None,
+            a1q_scale=gin_scales.flatten(0, 1),
+            a2_scale=None,
+            workspace13=None,
+            workspace2=None,
+            expert_tokens_meta=None,
+            apply_router_weight_on_input=False,
+        )
+
+        expected_ep_output = cutedsl_output.clone()
+        expected_ep_output[padding_rows] = 0
+        torch.testing.assert_close(
+            ep_output,
+            expected_ep_output,
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        assert torch.count_nonzero(ep_output[padding_rows]).item() == 0

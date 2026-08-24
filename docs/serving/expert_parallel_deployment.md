@@ -28,6 +28,7 @@ vLLM provides multiple communication backends for EP. Use `--all2all-backend` to
 | `deepep_low_latency` | Multi-node decode | CUDA graph support, masked layout, optimized for decode | Decode-dominated workloads, low-latency scenarios |
 | `flashinfer_nvlink_one_sided` | MNNVL systems | FlashInfer's one-sided A2A strategy for multi-node NVLink | High-throughput workloads |
 | `flashinfer_nvlink_two_sided` | MNNVL systems | FlashInfer's two-sided A2A strategy for multi-node NVLink | Systems with NVLink across nodes |
+| `flashinfer_gin` | Eight-GPU B200 nodes with RoCE/IB | Fused BF16-to-NVFP4/FP8 dispatch, rail relay, CUDA graph support | Experimental low-latency MoE decode at EP8–EP32 |
 
 ## Single Node Deployment
 
@@ -132,6 +133,64 @@ vllm serve deepseek-ai/DeepSeek-V3-0324 \
     export GLOO_SOCKET_IFNAME=eth0
     ```
     This ensures torch distributed group discovery uses Ethernet instead of InfiniBand for initial setup.
+
+### FlashInfer GIN Backend
+
+`flashinfer_gin` is an experimental GPU-initiated backend for full eight-GPU
+B200 nodes connected by RoCE or InfiniBand. It uses same-index inter-node puts
+followed by an NVLink fanout for multi-node dispatch.
+
+The initial implementation deliberately rejects configurations outside its
+validated contract:
+
+- EP is a multiple of eight from 8 through 32, with eight contiguous EP ranks
+  per node in node-major order and local ranks mapped in GPU-index order.
+- TP, PCP, and SP are 1, and DP equals EP.
+- Activations are BF16. The MoE uses static NVFP4 with
+  `--moe-backend flashinfer_trtllm` or `flashinfer_cutedsl`, or static
+  per-tensor FP8 with `flashinfer_trtllm`.
+- Experts divide evenly across ranks, use linear placement, and select an even
+  `top_k` from 2 through 8. EPLB is supported with fixed, linearly owned
+  physical expert slots; elastic EP, DBO, and multiple ubatches are not
+  supported.
+- FlashInfer must include `flashinfer.comm.gin_moe_alltoall`; `nvcc` and an
+  NCCL version with the GIN device API are required. Torch and FlashInfer must
+  resolve the same NCCL library. The backend fails during initialization if a
+  different or older `libnccl.so.2` is already loaded.
+
+GIN specializes on the physical expert layout. For example, 128 logical
+experts plus 16 EPLB replicas at EP16 produce 144 physical experts, or nine
+fixed slots per rank; rebalancing updates the logical mapping without rebuilding
+the GIN context.
+
+The symmetric workspace is persistent and scales with the configured maximum
+tokens per rank. For a decode-only deployment, set
+`--flashinfer-gin-max-num-tokens` to the largest synchronized decode batch the
+server will issue; forwards above that bound fail rather than reallocating a
+context captured by CUDA graphs. Omit the option to provision the scheduler's
+full maximum. `--flashinfer-gin-combine-quant` opts into NVFP4 combine traffic;
+BF16 combine is the accuracy-first default. Dispatch uses the two-phase rail
+relay for every supported EP size.
+
+`--flashinfer-gin-zero-copy-combine` makes fused expert compute write directly
+to the GIN combine input. With BF16 combine, this provisions a persistent
+registered buffer and requires a FlashInfer build with registered combine-input
+support. With NVFP4 combine, GIN quantizes directly from the ordinary expert
+output into its registered wire buffer. The optimization relies on the normal
+single-stream `dispatch -> expert -> combine` ordering and is incompatible with
+concurrent use of one GIN context.
+
+For example, add the following to both nodes of an EP16 NVFP4 deployment:
+
+```bash
+--all2all-backend flashinfer_gin \
+--moe-backend flashinfer_trtllm \
+--flashinfer-gin-max-num-tokens 128 \
+--flashinfer-gin-zero-copy-combine
+```
+
+NVFP4 deployments may use `--moe-backend flashinfer_cutedsl` instead of
+`flashinfer_trtllm`. FP8 dispatch currently requires `flashinfer_trtllm`.
 
 ## Expert Parallel Load Balancer (EPLB)
 
@@ -249,7 +308,7 @@ import uuid
 try:
     # 1: Set up clients for prefill and decode instances
     openai_api_key = "EMPTY"  # vLLM doesn't require a real API key
-    
+
     # Replace these IP addresses with your actual instance addresses
     prefill_client = OpenAI(
         api_key=openai_api_key,
@@ -257,9 +316,9 @@ try:
     )
     decode_client = OpenAI(
         api_key=openai_api_key,
-        base_url="http://192.168.1.101:8001/v1",  # Decode instance URL  
+        base_url="http://192.168.1.101:8001/v1",  # Decode instance URL
     )
-    
+
     # Get model name from prefill instance
     models = prefill_client.models.list()
     model = models.data[0].id
@@ -269,7 +328,7 @@ try:
     # Generate unique request ID to link prefill and decode operations
     request_id = str(uuid.uuid4())
     print(f"Request ID: {request_id}")
-    
+
     prefill_response = prefill_client.completions.create(
         model=model,
         # Prompt must exceed vLLM's block size (16 tokens) for PD to work
@@ -277,21 +336,21 @@ try:
         max_tokens=1,  # Force prefill-only operation
         extra_body={
             "kv_transfer_params": {
-                "do_remote_decode": True,     # Enable remote decode
-                "do_remote_prefill": False,   # This is the prefill instance
-                "remote_engine_id": None,     # Will be populated by vLLM
-                "remote_block_ids": None,     # Will be populated by vLLM
-                "remote_host": None,          # Will be populated by vLLM
-                "remote_port": None,          # Will be populated by vLLM
+                "do_remote_decode": True,  # Enable remote decode
+                "do_remote_prefill": False,  # This is the prefill instance
+                "remote_engine_id": None,  # Will be populated by vLLM
+                "remote_block_ids": None,  # Will be populated by vLLM
+                "remote_host": None,  # Will be populated by vLLM
+                "remote_port": None,  # Will be populated by vLLM
             }
         },
         extra_headers={"X-Request-Id": request_id},
     )
-    
+
     print("-" * 50)
     print("✓ Prefill completed successfully")
     print(f"Prefill response: {prefill_response.choices[0].text}")
-    
+
     # 3: Decode Phase
     # Transfer KV cache parameters from prefill to decode instance
     decode_response = decode_client.completions.create(
@@ -303,7 +362,7 @@ try:
         },
         extra_headers={"X-Request-Id": request_id},  # Same request ID
     )
-    
+
     print("-" * 50)
     print("✓ Decode completed successfully")
     print(f"Final response: {decode_response.choices[0].text}")

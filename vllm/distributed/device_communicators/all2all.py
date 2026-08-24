@@ -14,6 +14,7 @@ from vllm.distributed.utils import StatelessProcessGroup
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.utils.flashinfer import (
+    has_flashinfer_gin,
     has_flashinfer_nvlink_one_sided,
     has_flashinfer_nvlink_two_sided,
 )
@@ -35,6 +36,12 @@ if has_flashinfer_nvlink_one_sided():
     from flashinfer.comm.trtllm_moe_alltoall import (
         MoeAlltoAll,  # type: ignore[import-not-found]
         moe_a2a_get_workspace_size_per_rank,
+    )
+
+if has_flashinfer_gin():
+    from flashinfer.comm import (  # type: ignore[import-not-found]
+        GinMoeAlltoAll,
+        gin_moe_get_unique_id,
     )
 
 
@@ -698,11 +705,16 @@ class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
                 self.initialized = False
 
 
-class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
+class FlashInferNVLinkOneSidedManager(AgRsAll2AllManager):
     """
     All2All communication based on FlashInfer's MoeAlltoAll/One-sided NVLink kernel.
     This is a newer kernel from trtllm that should perform better than the kernel
     used by flashinfer_nvlink_two_sided.
+
+    Inherits AgRsAll2AllManager's collective-based dispatch()/combine() so MoE
+    layers using the naive_dp_ep prepare/finalize (e.g. an EAGLE draft with
+    `all2all_backend: allgather_reducescatter`) still work when this manager is
+    the EP group's singleton.
     """
 
     rank: int
@@ -900,6 +912,307 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             self.moe_alltoall.checkpoint_restore(CustomCommunicator(self.cpu_group))
 
 
+class FlashInferGinAll2AllManager(AgRsAll2AllManager):
+    """Own persistent FlashInfer GIN contexts for one EP process group.
+
+    GIN setup and teardown are collective, and captured CUDA graphs retain
+    pointers into each context. Handles therefore remain strongly owned by
+    this manager until explicit communicator shutdown.
+    """
+
+    def __init__(self, cpu_group):
+        if not has_flashinfer_gin():
+            raise RuntimeError(
+                "FlashInfer GIN is unavailable. Install a FlashInfer build with "
+                "flashinfer.comm.gin_moe_alltoall and make nvcc available."
+            )
+        super().__init__(cpu_group)
+        self._handles: dict[tuple[Any, ...], Any] = {}
+        self._lock = threading.RLock()
+        self._destroy_started = False
+        self.gpus_per_node = self._validate_rank_topology()
+
+    def _validate_rank_topology(self) -> int:
+        """Require full eight-GPU nodes in node-major EP rank order."""
+        if isinstance(self.cpu_group, StatelessProcessGroup):
+            raise ValueError("flashinfer_gin requires a torch CPU process group.")
+
+        if self.world_size < 8 or self.world_size > 32 or self.world_size % 8:
+            raise ValueError(
+                "flashinfer_gin requires full eight-GPU nodes at EP8-EP32; "
+                f"the EP world size is {self.world_size}."
+            )
+
+        from vllm.distributed.parallel_state import in_the_same_node_as
+
+        for source_rank in range(0, self.world_size, 8):
+            same_node = in_the_same_node_as(
+                self.cpu_group,
+                source_rank=source_rank,
+            )
+            rank_indices = [rank for rank, is_local in enumerate(same_node) if is_local]
+            expected_indices = list(range(source_rank, source_rank + 8))
+            if rank_indices != expected_indices:
+                raise ValueError(
+                    "flashinfer_gin requires exactly eight contiguous, node-major "
+                    "EP ranks per shared-memory node; "
+                    f"rank {source_rank} shares a node with {rank_indices}, "
+                    f"expected {expected_indices}."
+                )
+        return 8
+
+    def collective_error_check(
+        self,
+        phase: str,
+        local_error: str | None,
+    ) -> None:
+        """Make every EP rank fail before entering the next collective phase."""
+        errors: list[str | None] = [None] * self.world_size
+        dist.all_gather_object(
+            errors,
+            local_error,
+            group=self.cpu_group,
+        )
+        failures = [
+            f"rank {rank}: {error}"
+            for rank, error in enumerate(errors)
+            if error is not None
+        ]
+        if failures:
+            raise RuntimeError(
+                f"flashinfer_gin {phase} failed before native setup: "
+                + "; ".join(failures)
+            )
+
+    def _preload_module(
+        self,
+        top_k: int,
+        hidden: int,
+        num_experts: int,
+    ) -> Any:
+        module = None
+        error = None
+        try:
+            module = GinMoeAlltoAll.preload(
+                rank=self.rank,
+                ep_size=self.world_size,
+                gpus_per_node=self.gpus_per_node,
+                top_k=top_k,
+                hidden=hidden,
+                num_experts=num_experts,
+            )
+            if module is None:
+                error = "RuntimeError: flashinfer_gin JIT preload returned no module."
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        self.collective_error_check("JIT preload", error)
+        if module is None:
+            raise RuntimeError("flashinfer_gin JIT preload returned no module.")
+        return module
+
+    def _new_uid(self, module: Any) -> torch.Tensor:
+        uid = None
+        error = None
+        try:
+            if self.rank == 0:
+                uid = gin_moe_get_unique_id(module=module)
+            else:
+                uid = torch.empty(128, dtype=torch.uint8, device="cpu")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        self.collective_error_check("unique-ID generation", error)
+        if uid is None:
+            raise RuntimeError("flashinfer_gin unique-ID generation returned no ID.")
+        ranks = dist.get_process_group_ranks(self.cpu_group)
+        dist.broadcast(uid, src=ranks[0], group=self.cpu_group)
+        return uid
+
+    def get_handle(self, kwargs):
+        max_num_tokens = int(kwargs["max_num_tokens"])
+        top_k = int(kwargs["top_k"])
+        hidden = int(kwargs["hidden"])
+        num_experts = int(kwargs["num_experts"])
+        combine_quant = int(kwargs.get("combine_quant", 0))
+        zero_copy_combine = int(kwargs.get("zero_copy_combine", 0))
+        dispatch_quantization = str(kwargs.get("dispatch_quantization", "nvfp4"))
+        if max_num_tokens <= 0:
+            raise ValueError("flashinfer_gin max_num_tokens must be positive.")
+        if top_k < 2 or top_k > 8 or top_k % 2:
+            raise ValueError("flashinfer_gin requires even top_k in [2, 8].")
+        if hidden <= 0 or hidden % 64:
+            raise ValueError(
+                "flashinfer_gin hidden size must be a positive multiple of 64."
+            )
+        if num_experts <= 0 or num_experts % self.world_size:
+            raise ValueError(
+                "flashinfer_gin experts must divide evenly across EP ranks."
+            )
+        if combine_quant not in (0, 1):
+            raise ValueError("flashinfer_gin combine_quant must be 0 or 1.")
+        if zero_copy_combine not in (0, 1):
+            raise ValueError("flashinfer_gin zero_copy_combine must be 0 or 1.")
+        if max_num_tokens >= 65535:
+            raise ValueError(
+                "flashinfer_gin rail_relay requires max_num_tokens < 65535."
+            )
+        if dispatch_quantization not in ("nvfp4", "fp8_per_tensor"):
+            raise ValueError(
+                "flashinfer_gin dispatch_quantization must be nvfp4 or fp8_per_tensor."
+            )
+        # dispatch_quantization is part of the key because a main model and its
+        # EAGLE draft can agree on every other field while needing different wire
+        # formats and independently sized receive buffers.
+        key = (
+            max_num_tokens,
+            top_k,
+            hidden,
+            num_experts,
+            self.gpus_per_node,
+            combine_quant,
+            zero_copy_combine,
+            dispatch_quantization,
+        )
+
+        with self._lock:
+            if self._destroy_started:
+                raise RuntimeError("flashinfer_gin manager is shutting down")
+            handle = self._handles.get(key)
+            if handle is not None:
+                return handle
+
+            # Module compilation/loading is shape-specialized and may fail on
+            # only one rank. Complete the same collective error check on every
+            # rank before allocating receive views or entering native NCCL
+            # setup, otherwise a peer could block forever in the collective.
+            module = self._preload_module(top_k, hidden, num_experts)
+
+            capability_error = None
+            if zero_copy_combine:
+                try:
+                    required_methods = ["combine_zero_copy_async"]
+                    if not combine_quant:
+                        required_methods.append("get_registered_combine_input")
+                    missing_methods = [
+                        method
+                        for method in required_methods
+                        if not hasattr(GinMoeAlltoAll, method)
+                    ]
+                    if not combine_quant and not supports_kw(
+                        GinMoeAlltoAll.create,
+                        "enable_zero_copy_combine",
+                        allow_var_kwargs=False,
+                    ):
+                        missing_methods.append("create(enable_zero_copy_combine=...)")
+                    if missing_methods:
+                        capability_error = (
+                            "installed FlashInfer lacks GIN zero-copy APIs: "
+                            + ", ".join(missing_methods)
+                        )
+                except Exception as exc:
+                    capability_error = (
+                        "failed to inspect installed FlashInfer GIN zero-copy "
+                        f"APIs: {type(exc).__name__}: {exc}"
+                    )
+                self.collective_error_check(
+                    "zero-copy capability validation",
+                    capability_error,
+                )
+                if capability_error is not None:
+                    raise RuntimeError(capability_error)
+
+            recv_views = None
+            allocation_error = None
+            try:
+                recv_views = GinMoeAlltoAll.allocate_recv_views(
+                    self.world_size,
+                    max_num_tokens,
+                    top_k,
+                    hidden,
+                    dispatch_quantization,
+                )
+            except Exception as exc:
+                allocation_error = f"{type(exc).__name__}: {exc}"
+            self.collective_error_check(
+                "receive-view allocation",
+                allocation_error,
+            )
+            if recv_views is None:
+                raise RuntimeError(
+                    "flashinfer_gin receive-view allocation returned no tensors."
+                )
+
+            uid = self._new_uid(module)
+            create_kwargs = dict(
+                module=module,
+                uid=uid,
+                rank=self.rank,
+                ep_size=self.world_size,
+                max_num_tokens=max_num_tokens,
+                top_k=top_k,
+                hidden=hidden,
+                num_experts=num_experts,
+                gpus_per_node=self.gpus_per_node,
+                use_lsa=1,
+                combine_quant=combine_quant,
+                dispatch_quantization=dispatch_quantization,
+                recv_views=recv_views,
+            )
+            if supports_kw(
+                GinMoeAlltoAll.create,
+                "dispatch_transport",
+                allow_var_kwargs=False,
+            ):
+                create_kwargs["dispatch_transport"] = "rail_relay"
+            if zero_copy_combine and not combine_quant:
+                create_kwargs["enable_zero_copy_combine"] = True
+            handle = GinMoeAlltoAll.create(**create_kwargs)
+            self._handles[key] = handle
+            logger.info(
+                "FlashInfer GIN initialized for rank=%d, ep_size=%d, "
+                "max_tokens=%d, top_k=%d, hidden=%d, experts=%d, "
+                "transport=rail_relay, dispatch_quant=%s, combine_quant=%d, "
+                "zero_copy_combine=%d",
+                self.rank,
+                self.world_size,
+                max_num_tokens,
+                top_k,
+                hidden,
+                num_experts,
+                dispatch_quantization,
+                combine_quant,
+                zero_copy_combine,
+            )
+            return handle
+
+    def destroy(self):
+        with self._lock:
+            if self._destroy_started:
+                return
+            self._destroy_started = True
+
+            torch.accelerator.synchronize()
+            first_error: BaseException | None = None
+            for key, handle in self._handles.items():
+                try:
+                    handle.destroy()
+                except BaseException as error:
+                    logger.exception(
+                        "Failed to destroy FlashInfer GIN context %s",
+                        key,
+                    )
+                    if first_error is None:
+                        first_error = error
+
+            if first_error is None:
+                self._handles.clear()
+            else:
+                # Keep Python buffers alive: native teardown failures are not
+                # retryable and may leave registered pointers behind.
+                raise RuntimeError(
+                    "one or more FlashInfer GIN contexts failed to shut down"
+                ) from first_error
+
+
 class MoriAll2AllManager(All2AllManagerBase):
     def __init__(self, cpu_group, all2all_backend: str):
         assert has_mori(), (
@@ -1018,6 +1331,29 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
         self.handle_cache = Cache()
         self._num_sms: int | None = None
         self._gin_checked = False
+        self._comm_warmed_up = False
+
+    def _ensure_comm_initialized(self) -> None:
+        """Force the EP group's NCCL communicator to materialize before DeepEP
+        touches it.
+
+        DeepEP's ``ElasticBuffer`` immediately calls ``get_physical_domain_size``
+        -> ``ncclTeamWorld(comm)`` on the raw comm pointer it pulls from
+        ``backend._comm_ptr()``. PyTorch creates that NCCL comm *lazily* on the
+        first collective, so if no collective has run on this group yet,
+        ``_comm_ptr()`` returns NULL and ``ncclTeamWorld`` segfaults. A single
+        warmup all_reduce on the exact group we hand to DeepEP guarantees the
+        comm exists. Idempotent: only the first call does work.
+        """
+        if self._comm_warmed_up:
+            return
+        group = self._device_group if self._device_group is not None else self.cpu_group
+        # The comm DeepEP needs is the *device* (NCCL) group's comm; warm it with
+        # a CUDA collective so PyTorch eagerly creates the communicator.
+        warmup = torch.ones(1, device=torch.device("cuda", torch.cuda.current_device()))
+        dist.all_reduce(warmup, group=group)
+        torch.cuda.synchronize()
+        self._comm_warmed_up = True
 
     def _make_all2all_kwargs(
         self,
@@ -1065,6 +1401,11 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
 
     def get_handle(self, kwargs):
         import deep_ep  # type: ignore[import-not-found]
+
+        # DeepEP reads the raw NCCL comm pointer the moment the ElasticBuffer is
+        # built; make sure PyTorch has actually created it first (see
+        # _ensure_comm_initialized) to avoid a NULL-comm segfault in ncclTeamWorld.
+        self._ensure_comm_initialized()
 
         num_experts = kwargs.pop("num_experts", 256)
         buffer_kwargs = self._make_all2all_kwargs(**kwargs)

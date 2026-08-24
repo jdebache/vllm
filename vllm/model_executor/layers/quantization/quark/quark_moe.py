@@ -455,6 +455,7 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
             fp8_backend=self.fp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
+            layer=layer,
         )
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:

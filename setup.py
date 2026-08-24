@@ -277,6 +277,18 @@ class cmake_build_ext(build_ext):
                 "-DCMAKE_HIP_COMPILER_LAUNCHER=ccache",
             ]
 
+        # Forward the optional-extension switches to CMake. They are declared
+        # there with option(... ON), which creates a *cache* variable -- CMake
+        # never consults the environment for one, so exporting
+        # VLLM_USE_DEEPGEMM=0 / VLLM_USE_QUTLASS=0 was silently ignored and both
+        # extensions were cloned and compiled regardless. The env vars were
+        # honoured only when deciding wheel contents further down, which is why
+        # the mismatch went unnoticed.
+        for _opt in ("VLLM_USE_DEEPGEMM", "VLLM_USE_QUTLASS"):
+            _val = os.environ.get(_opt)
+            if _val is not None:
+                cmake_args += ["-D{}={}".format(_opt, "OFF" if _val == "0" else "ON")]
+
         # Pass the python executable to cmake so it can find an exact
         # match.
         cmake_args += ["-DVLLM_PYTHON_EXECUTABLE={}".format(sys.executable)]
@@ -1164,8 +1176,10 @@ if _is_cuda():
     ):
         # DeepGEMM requires CUDA 12.3+ (SM90/SM100)
         # Optional since it won't build on unsupported architectures
-        ext_modules.append(CMakeExtension(name="vllm._deep_gemm_C", optional=True))
-        ext_modules.append(CMakeExtension(name="vllm._qutlass_C", optional=True))
+        if os.environ.get("VLLM_USE_DEEPGEMM", "1") != "0":
+            ext_modules.append(CMakeExtension(name="vllm._deep_gemm_C", optional=True))
+        if os.environ.get("VLLM_USE_QUTLASS", "1") != "0":
+            ext_modules.append(CMakeExtension(name="vllm._qutlass_C", optional=True))
     # fmha_sm100 is a Python/CuTe-DSL package installed into vllm.third_party.
     ext_modules.append(CMakeExtension(name="vllm.fmha_sm100", optional=True))
     # tml-fa4 is copied into an isolated vllm.third_party package.
