@@ -117,11 +117,12 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         payloads.append(topk_weights)
 
         assert self.all2all_manager.moe_alltoall is not None  # type: ignore[attr-defined]
+        assert expert_map is not None, "expert_map required to filter padding sentinel"
         recv_payloads = self.all2all_manager.moe_alltoall.dispatch(  # type: ignore[attr-defined]
             token_selected_experts=topk_ids,
             input_payloads=payloads,
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
-            invalid_token_expert_id=-1,  # Follow TRTLLM Pattern
+            invalid_token_expert_id=num_experts,
             expert_id_payload_index=topk_ids_payload_index,
         )
         if dispatch_x_sf is not None:

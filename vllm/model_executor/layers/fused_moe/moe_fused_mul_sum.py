@@ -13,6 +13,7 @@ def moe_fused_mul_sum_kernel(
     outputs_ptr,
     top_ids_ptr,
     expert_map_ptr,
+    expert_map_size,
     num_valid_tokens_ptr,
     stride_m,
     has_topk_ids: tl.constexpr,
@@ -42,11 +43,13 @@ def moe_fused_mul_sum_kernel(
         for n in tl.static_range(top_k):
             id_val = tl.load(top_ids_ptr + pid_m * top_k + n)
             valid = id_val >= 0
-            any_valid += valid.to(tl.int32)
-            take = valid
             if has_expert_map:
+                valid = valid & (id_val < expert_map_size)
                 local_id = tl.load(expert_map_ptr + tl.where(valid, id_val, 0))
                 take = valid & (local_id >= 0)
+            else:
+                take = valid
+            any_valid += valid.to(tl.int32)
             takes += (take,)  # type: ignore[assignment]
             weights += (tl.load(w_row + n).to(tl.float32),)  # type: ignore[assignment]
         # All-padding rows early-return untouched (decode contract past num_recv).
@@ -104,14 +107,15 @@ def moe_fused_mul_sum(
         outputs: Optional pre-allocated output tensor.
             Shape: (num_tokens, hidden_size).
         topk_ids: Optional indices of the top-k experts. Shape:
-            (num_tokens, top_k). A value of -1 marks a slot the expert GEMM
-            skipped; those slots are excluded from the sum. When provided, rows
-            with all top ids < 0 (worst-case padding) are skipped and their
-            output rows left untouched. Required when `expert_map` is provided.
+            (num_tokens, top_k). Negative values mark slots the expert GEMM
+            skipped. When `expert_map` is provided, values outside its bounds
+            are also invalid. Invalid slots are excluded from the sum. Rows with
+            all invalid ids are skipped and their output rows left untouched.
+            Required when `expert_map` is provided.
         expert_map: Optional mapping for Expert Parallelism. A value < 0
             indicates an invalid token/expert pair that will be skipped. Only
             needed when `topk_ids` may contain non-local expert ids; if every
-            non-(-1) id is already a local expert, leave it None to skip the
+            nonnegative id is a valid local expert, leave it None to skip the
             redundant per-slot lookup.
         num_valid_tokens: Optional device scalar (1-element tensor) holding the
             number of real token rows (num_recv for a decode dispatch). When
@@ -157,6 +161,7 @@ def moe_fused_mul_sum(
             outputs,
             topk_ids,
             expert_map,
+            expert_map.numel() if expert_map is not None else 0,
             num_valid_tokens,
             top_k * hidden_size,
             topk_ids is not None,

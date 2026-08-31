@@ -21,7 +21,7 @@ from vllm.distributed import (
     get_pcp_group,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -346,7 +346,36 @@ class Config:
         except NotImplementedError:
             pass
 
+        try:
+            if not self.fused_experts_type._supports_parallel_config(
+                self.moe_parallel_config()
+            ):
+                return (
+                    False,
+                    f"{self.fused_experts_type.__name__} does not support "
+                    "the parallel config.",
+                )
+        except NotImplementedError:
+            pass
+
         return True, None
+
+    def moe_parallel_config(self) -> FusedMoEParallelConfig:
+        use_ep = self.world_size > 1
+        return FusedMoEParallelConfig(
+            tp_size=1,
+            pcp_size=1,
+            dp_size=self.world_size,
+            ep_size=self.world_size if use_ep else 1,
+            tp_rank=0,
+            pcp_rank=0,
+            dp_rank=0,
+            ep_rank=0,
+            sp_size=1,
+            use_ep=use_ep,
+            all2all_backend=self.all2all_backend() or "",
+            enable_eplb=False,
+        )
 
 
 @dataclass
@@ -643,7 +672,9 @@ def make_modular_kernel(
         num_logical_experts=config.E,
         moe_parallel_config=moe_parallel_config,
         in_dtype=config.dtype,
-        max_num_tokens=next_power_of_2(config.M),
+        # After an EP dispatch a rank's experts can see up to
+        # world_size * M tokens.
+        max_num_tokens=next_power_of_2(config.M) * config.world_size,
         activation=MoEActivation.SILU,
         device=vllm_config.device_config.device,
         routing_method=RoutingMethodType.DeepSeekV3,
@@ -755,6 +786,12 @@ def run_modular_kernel(
         block_shape=config.quant_block_shape,
         per_act_token_quant=config.is_per_act_token_quant,
         per_out_ch_quant=config.is_per_out_ch_quant,
+        # Mirror oracle/nvfp4.py: the TRTLLM kernel takes linear
+        # (unswizzled) input quant scales.
+        is_scale_swizzled=(
+            getattr(config.fused_experts_type, "__name__", "")
+            != "TrtLlmNvFp4ExpertsModular"
+        ),
     )
 
     mk = make_modular_kernel(config, vllm_config, quant_config)
@@ -790,6 +827,11 @@ def run_modular_kernel(
         num_tokens=num_tokens,
         num_tokens_across_dp=num_tokens_across_dp,
     ):
-        out = mk.apply(**mk_kwargs)
+        dp_metadata = get_forward_context().dp_metadata
+        if dp_metadata is not None:
+            with dp_metadata.sp_local_sizes(sequence_parallel_size=1):
+                out = mk.apply(**mk_kwargs)
+        else:
+            out = mk.apply(**mk_kwargs)
 
     return out
